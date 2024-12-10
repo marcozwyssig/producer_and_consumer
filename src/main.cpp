@@ -59,6 +59,20 @@ public:
     }
 };
 
+// Event ID Generator for managing topic-specific event counters
+class EventIdGenerator {
+private:
+    std::unordered_map<std::string, int> topicEventCounters;
+    std::mutex mtx;
+
+public:
+    int getNextEventId(const std::string& topic) {
+        std::lock_guard<std::mutex> lock(mtx);
+        int& counter = topicEventCounters[topic]; // Access or initialize counter for topic
+        return ++counter; // Increment and return the counter
+    }
+};
+
 // Concrete Observer (Consumer)
 class Consumer : public Observer {
 private:
@@ -85,7 +99,6 @@ public:
     }
 
     void processEvents() {
-        log("Consumer " + std::to_string(id) + " started processing events.");
         while (running) {
             Event event;
             {
@@ -119,27 +132,23 @@ class Producer : public Observable {
 private:
     int id;
     std::future<void> producerFuture;
-    std::unordered_map<std::string, int> topicCounters; // Tracks the last event ID per topic
-    std::mutex mtx; // Mutex for thread-safe counter updates
+    EventIdGenerator& eventGenerator; // Shared event ID generator
 
 public:
-    explicit Producer(int id) : id(id) {}
+    explicit Producer(int id, EventIdGenerator& generator) : id(id), eventGenerator(generator) {}
 
     Producer& addObserver(const std::string& topic, const std::shared_ptr<Observer>& observer) {
         Observable::addObserver(topic, observer);
         return *this;
     }
 
-    void produceAsync(const std::string& topic, int numEvents) {
+    Producer& produceAsync(const std::string& topic, int numEvents) {
         producerFuture = std::async(std::launch::async, [this, topic, numEvents]() {
             for (int i = 0; i < numEvents; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Simulate work
                 
-                int eventId;
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    eventId = ++topicCounters[topic]; // Increment and get unique event ID for the topic
-                }
+                // Get the next unique event ID for the topic
+                int eventId = eventGenerator.getNextEventId(topic);
 
                 Event event{id, topic, eventId, "Generated event " + std::to_string(eventId)};
                 log("Producer " + std::to_string(id) + " generated event: " +
@@ -147,6 +156,7 @@ public:
                 notifyObservers(event);
             }
         });
+        return *this;
     }
 
     void wait() {
@@ -154,6 +164,10 @@ public:
             producerFuture.get();
         }
         log("Producer " + std::to_string(id) + " finished producing.");
+    }
+
+    Producer& startProducer(const std::string& topic, int numEvents) {
+        return produceAsync(topic, numEvents);
     }
 };
 
@@ -169,12 +183,11 @@ public:
     std::shared_ptr<Consumer> createConsumer() {
         auto consumer = std::make_shared<Consumer>(++consumerCounter);
         consumers.push_back(consumer);
-        log("Created Consumer with ID: " + std::to_string(consumerCounter));
         return consumer;
     }
 
-    Producer& createProducer(int id) {
-        auto producer = std::make_shared<Producer>(id);
+    Producer& createProducer(int id, EventIdGenerator& generator) {
+        auto producer = std::make_shared<Producer>(id, generator);
         producers.push_back(producer);
         log("Created a new producer with ID: " + std::to_string(id));
         return *producer;
@@ -184,14 +197,6 @@ public:
         log("Starting consumers...");
         for (auto& consumer : consumers) {
             consumerThreads.emplace_back([consumer]() { consumer->processEvents(); });
-        }
-        return *this;
-    }
-
-    ProducerConsumerOrchestrator& startProducers(const std::string& topic, int numEvents) {
-        log("Starting producers for topic: " + topic + " with " + std::to_string(numEvents) + " events.");
-        for (auto& producer : producers) {
-            producer->produceAsync(topic, numEvents);
         }
         return *this;
     }
@@ -222,25 +227,26 @@ public:
 // Main function
 int main() {
     log("Starting producer-consumer orchestrator.");
+    EventIdGenerator eventGenerator; // Shared event generator
     ProducerConsumerOrchestrator orchestrator;
 
     auto consumer1 = orchestrator.createConsumer(); // Consumer 1
     auto consumer2 = orchestrator.createConsumer(); // Consumer 2
 
-    orchestrator.createProducer(1)
+    orchestrator
+        .createProducer(1, eventGenerator)
         .addObserver("topicA", consumer1)
-        .addObserver("topicB", consumer1)
-        .addObserver("topicA", consumer2)
-        .addObserver("topicB", consumer2);
+        .addObserver("topicB", consumer2)
+        .startProducer("topicA", 2);
 
-    orchestrator.createProducer(2)
+    orchestrator
+        .createProducer(2, eventGenerator)
         .addObserver("topicA", consumer1)
-        .addObserver("topicB", consumer2);
+        .addObserver("topicB", consumer2)
+        .startProducer("topicB", 3);
 
     orchestrator
         .startConsumers()
-        .startProducers("topicA", 2)
-        .startProducers("topicA", 2)
         .waitForProducers()
         .stopConsumers();
 
