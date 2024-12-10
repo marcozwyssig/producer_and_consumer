@@ -1,0 +1,29 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++ build all files in src",
+            "command": "/usr/bin/g++",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-std=c++17",
+                "-g",
+                "${workspaceFolder}/src/*.cpp",
+                "-o",
+                "${workspaceFolder}/bin/output_executable"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Task generated for compiling all files in src directory."
+        }
+    ],
+    "version": "2.0.0"
+}
