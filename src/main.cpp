@@ -1,12 +1,12 @@
 /**
  * A multi-threaded Producer-Consumer example using C++.
- *
+ * 
  * Features:
  * - Observers for event handling.
  * - Mutex locking for thread safety.
  * - Condition variables for consumer synchronization.
  * - Async producer event generation.
- *
+ * 
  * Classes:
  * - MutexLocker: Encapsulates mutex functionality for thread safety.
  * - Event: Represents a producer-generated event.
@@ -30,6 +30,7 @@
 #include <future>
 #include <sstream>
 #include <optional>
+#include <functional>
 
 /**
  * Utility for logging messages with thread ID for debugging purposes.
@@ -166,13 +167,16 @@ private:
     MutexLocker locker; ///< MutexLocker for thread safety.
     std::condition_variable cv; ///< Condition variable for event synchronization.
     std::atomic<bool> running{true}; ///< Indicates if the consumer is running.
+    std::function<void(const Event&)> consumeLogic; ///< Custom consume logic.
 
 public:
     /**
-     * Constructor initializes a consumer with an ID.
+     * Constructor initializes a consumer with an ID and custom logic.
      * @param id Unique consumer ID.
+     * @param logic Custom logic for processing events.
      */
-    explicit Consumer(int id) : id(id) {
+    explicit Consumer(int id, std::function<void(const Event&)> logic) 
+        : id(id), consumeLogic(std::move(logic)) {
         log("Consumer " + std::to_string(id) + " created.");
     }
 
@@ -212,10 +216,7 @@ public:
             }
 
             const auto& event = eventOpt.value();
-            log("Consumer " + std::to_string(id) + " processed event: Producer " +
-                std::to_string(event.producerId) + ", Topic " + event.topic +
-                ", Event " + std::to_string(event.eventId) +
-                ", Change: " + event.changeData);
+            consumeLogic(event);
         }
         log("Consumer " + std::to_string(id) + " stopped processing events.");
     }
@@ -238,16 +239,17 @@ private:
     int id; ///< Unique producer ID.
     std::future<void> producerFuture; ///< Future for asynchronous event generation.
     EventIdGenerator& eventGenerator; ///< Shared event ID generator.
+    std::function<std::string(int, const std::string&)> dataGenerationLogic; ///< Custom data generation logic.
 
 public:
     /**
-     * Constructor initializes a producer with an ID and event generator.
+     * Constructor initializes a producer with an ID, event generator, and custom logic.
      * @param id Unique producer ID.
      * @param generator Reference to the event ID generator.
+     * @param logic Custom logic for generating event data.
      */
-    explicit Producer(int id, EventIdGenerator& generator)
-        : id(id), eventGenerator(generator)
-    {}
+    explicit Producer(int id, EventIdGenerator& generator, std::function<std::string(int, const std::string&)> logic) 
+        : id(id), eventGenerator(generator), dataGenerationLogic(std::move(logic)) {}
 
     /**
      * Adds an observer to a topic.
@@ -269,11 +271,12 @@ public:
     Producer& produceAsync(const std::string& topic, int numEvents) {
         producerFuture = std::async(std::launch::async, [this, topic, numEvents]() {
             for (int i = 0; i < numEvents; ++i) {
-                int eventId = eventGenerator.getNextEventId(topic);
-                Event event{id, topic, eventId, "Generated event " + std::to_string(eventId)};
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                int eventId = eventGenerator.getNextEventId(topic);
+                std::string data = dataGenerationLogic(id, topic);
+                Event event{id, topic, eventId, data};
                 log("Producer " + std::to_string(id) + " generated event: " +
-                    std::to_string(eventId) + " on topic " + topic);
+                    std::to_string(event.eventId) + " on topic " + topic);
                 notifyObservers(event);
             }
         });
@@ -313,22 +316,24 @@ public:
     }
 
     /**
-     * Creates a producer with a unique ID.
+     * Creates a producer with a unique ID and custom logic.
      * @param id The unique ID for the producer.
+     * @param logic Custom logic for generating event data.
      * @return A shared pointer to the created producer.
      */
-    std::shared_ptr<Producer> createProducer(int id) {
-        auto producer = std::make_shared<Producer>(id, eventGenerator);
+    std::shared_ptr<Producer> createProducer(int id, std::function<std::string(int, const std::string&)> logic) {
+        auto producer = std::make_shared<Producer>(id, eventGenerator, std::move(logic));
         producers.push_back(producer);
         return producer;
     }
 
     /**
-     * Creates a consumer.
+     * Creates a consumer with custom logic.
+     * @param logic Custom logic for processing events.
      * @return A shared pointer to the created consumer.
      */
-    std::shared_ptr<Consumer> createConsumer() {
-        auto consumer = std::make_shared<Consumer>(consumers.size() + 1);
+    std::shared_ptr<Consumer> createConsumer(std::function<void(const Event&)> logic) {
+        auto consumer = std::make_shared<Consumer>(consumers.size() + 1, std::move(logic));
         consumers.push_back(consumer);
         return consumer;
     }
@@ -365,19 +370,32 @@ public:
  * Main function demonstrates the Producer-Consumer system.
  */
 int main() {
-    ProducerConsumerOrchestrator()
-        .configureAndProduceEvents([&](ProducerConsumerOrchestrator& orchestrator) {
-            auto consumer1 = orchestrator.createConsumer();
-            auto consumer2 = orchestrator.createConsumer();
+    ProducerConsumerOrchestrator orchestrator;
 
-            auto producer1 = orchestrator.createProducer(1);
+    orchestrator
+        .configureAndProduceEvents([&](ProducerConsumerOrchestrator& orchestrator) {
+            auto consumer1 = orchestrator.createConsumer([](const Event& event) {
+                log("Custom handler for Consumer 1: " + event.changeData);
+            });
+
+            auto consumer2 = orchestrator.createConsumer([](const Event& event) {
+                log("Custom handler for Consumer 2: Processing " + event.changeData);
+            });
+
+            auto producer1 = orchestrator.createProducer(1, [](int producerId, const std::string& topic) {
+                return "Custom event data for topic " + topic + " by Producer " + std::to_string(producerId);
+            });
+
             producer1->addObserver("topicA", consumer1);
 
-            auto producer2 = orchestrator.createProducer(2);
+            auto producer2 = orchestrator.createProducer(2, [](int producerId, const std::string& topic) {
+                return "Generated data for topic " + topic;
+            });
+
             producer2->addObserver("topicB", consumer2);
 
-            producer1->produceAsync("topicA", 5);
-            producer2->produceAsync("topicB", 3);
+            producer1->produceAsync("topicA", 1);
+            producer2->produceAsync("topicB", 1);
         })
         .consumeEvents();
 
