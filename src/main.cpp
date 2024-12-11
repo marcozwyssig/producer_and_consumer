@@ -177,7 +177,7 @@ private:
     MutexLocker queueLocker;
     std::atomic<bool> running{true};
     std::condition_variable cv;
-    std::mutex cvMutex;
+    MutexLocker cvMutex;
     std::future<void> detectionFuture;
     std::future<void> notificationFuture;
 
@@ -198,17 +198,18 @@ private:
     void notificationThreadFunction() {
         try {
             while (running || !eventQueue.empty()) {
-                std::unique_lock<std::mutex> lock(cvMutex);
-                cv.wait(lock, [this] { return !eventQueue.empty() || !running; });
+                cvMutex.runWithUniqueLock([&](std::unique_lock<std::mutex> lock) {
+                    cv.wait(lock, [this] { return !eventQueue.empty() || !running; });
 
-                if (!eventQueue.empty()) {
-                    Event event;
-                    queueLocker.runWithLockGuard([&]() {
-                        event = eventQueue.front();
-                        eventQueue.pop_front();
-                    });
-                    notifyObservers(event);
-                }
+                    if (!eventQueue.empty()) {
+                        Event event;
+                        queueLocker.runWithLockGuard([&]() {
+                            event = eventQueue.front();
+                            eventQueue.pop_front();
+                        });
+                        notifyObservers(event);
+                    }
+                });
             }
         } catch (const std::exception& ex) {
             log("Error in notification thread: " + std::string(ex.what()));
