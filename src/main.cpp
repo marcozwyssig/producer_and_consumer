@@ -1,12 +1,12 @@
 /**
  * A multi-threaded Producer-Consumer example using C++.
- * 
+ *
  * Features:
  * - Observers for event handling.
  * - Mutex locking for thread safety.
  * - Condition variables for consumer synchronization.
  * - Async producer event generation.
- * 
+ *
  * Classes:
  * - MutexLocker: Encapsulates mutex functionality for thread safety.
  * - Event: Represents a producer-generated event.
@@ -112,7 +112,6 @@ public:
         locker.runWithLockGuard([&] {
             topicObservers[topic].push_back(observer);
             log("Added observer to topic: " + topic);
-            return this;
         });
         return *this;
     }
@@ -246,8 +245,8 @@ public:
      * @param id Unique producer ID.
      * @param generator Reference to the event ID generator.
      */
-    explicit Producer(int id, EventIdGenerator& generator) 
-        : id(id), eventGenerator(generator) 
+    explicit Producer(int id, EventIdGenerator& generator)
+        : id(id), eventGenerator(generator)
     {}
 
     /**
@@ -270,9 +269,9 @@ public:
     Producer& produceAsync(const std::string& topic, int numEvents) {
         producerFuture = std::async(std::launch::async, [this, topic, numEvents]() {
             for (int i = 0; i < numEvents; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 int eventId = eventGenerator.getNextEventId(topic);
                 Event event{id, topic, eventId, "Generated event " + std::to_string(eventId)};
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 log("Producer " + std::to_string(id) + " generated event: " +
                     std::to_string(eventId) + " on topic " + topic);
                 notifyObservers(event);
@@ -300,6 +299,7 @@ private:
     std::vector<std::shared_ptr<Consumer>> consumers; ///< List of consumers.
     std::vector<std::shared_ptr<Producer>> producers; ///< List of producers.
     std::vector<std::function<void()>> configurations; ///< Configurations to apply.
+    EventIdGenerator eventGenerator; ///< Integrated event ID generator.
 
 public:
     /**
@@ -313,13 +313,12 @@ public:
     }
 
     /**
-     * Creates a producer with a unique ID and shared event generator.
+     * Creates a producer with a unique ID.
      * @param id The unique ID for the producer.
-     * @param generator Reference to the event ID generator.
      * @return A shared pointer to the created producer.
      */
-    std::shared_ptr<Producer> createProducer(int id, EventIdGenerator& generator) {
-        auto producer = std::make_shared<Producer>(id, generator);
+    std::shared_ptr<Producer> createProducer(int id) {
+        auto producer = std::make_shared<Producer>(id, eventGenerator);
         producers.push_back(producer);
         return producer;
     }
@@ -366,18 +365,15 @@ public:
  * Main function demonstrates the Producer-Consumer system.
  */
 int main() {
-    EventIdGenerator eventGenerator;
-    ProducerConsumerOrchestrator orchestrator;
-
-    orchestrator
+    ProducerConsumerOrchestrator()
         .configureAndProduceEvents([&](ProducerConsumerOrchestrator& orchestrator) {
             auto consumer1 = orchestrator.createConsumer();
             auto consumer2 = orchestrator.createConsumer();
 
-            auto producer1 = orchestrator.createProducer(1, eventGenerator);
+            auto producer1 = orchestrator.createProducer(1);
             producer1->addObserver("topicA", consumer1);
 
-            auto producer2 = orchestrator.createProducer(2, eventGenerator);
+            auto producer2 = orchestrator.createProducer(2);
             producer2->addObserver("topicB", consumer2);
 
             producer1->produceAsync("topicA", 5);
