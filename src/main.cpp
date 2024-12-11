@@ -258,10 +258,9 @@ public:
      * Starts producing events asynchronously.
      * @return A reference to the current object.
      */
-    Producer& produceAsync() {
+    void produceAsync() {
         detectionFuture = std::async(std::launch::async, &Producer::detectionThreadFunction, this);
         notificationFuture = std::async(std::launch::async, &Producer::notificationThreadFunction, this);
-        return *this;
     }
 
     Event createEvent(const std::string& topic, const std::string& data) {
@@ -332,7 +331,7 @@ public:
      * Starts consuming and processing events.
      * @return A reference to the current object.
      */
-    ProducerConsumerOrchestrator& consumeEvents() {
+    void produceAndconsumeEvents() {
         log("Apply configurations before starting the producers.");
         for (const auto& config : configurations) {
             config();
@@ -350,8 +349,6 @@ public:
         for (auto& producer : producers) {
             producer->stop();
         }
-
-        return *this;
     }
 };
 
