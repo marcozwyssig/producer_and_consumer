@@ -9,6 +9,7 @@
 #include <atomic>
 #include <future>
 #include <sstream>
+#include <optional>
 
 // Utility for logging with thread ID
 void log(const std::string& message) {
@@ -16,6 +17,29 @@ void log(const std::string& message) {
     oss << "[Thread " << std::this_thread::get_id() << "] " << message << std::endl;
     std::cout << oss.str();
 }
+
+class MutexLocker {
+public:
+    // Constructor creates an internal mutex
+    MutexLocker() = default;
+
+    // Method to invoke a task within a lock
+    template <typename Callable>
+    auto runWithLockGuard(Callable&& task) {
+        std::lock_guard<std::mutex> lock(mtx);
+        return task();
+    }
+
+    template <typename Callable>
+    auto runWithUniqueLock(Callable&& task) {
+        std::unique_lock<std::mutex> lock(mtx);
+        return task(std::move(lock)); // Pass the unique_lock to the task
+    }
+
+private:
+    std::mutex mtx; // Internal mutex
+};
+
 
 // Event structure
 struct Event {
@@ -36,26 +60,29 @@ public:
 class Observable {
 private:
     std::unordered_map<std::string, std::vector<std::shared_ptr<Observer>>> topicObservers;
-    std::mutex mtx;
+    MutexLocker locker;
 
 public:
     Observable& addObserver(const std::string& topic, const std::shared_ptr<Observer>& observer) {
-        std::lock_guard<std::mutex> lock(mtx);
-        topicObservers[topic].push_back(observer);
-        log("Added observer to topic: " + topic);
+        locker.runWithLockGuard([&] {
+            topicObservers[topic].push_back(observer);
+            log("Added observer to topic: " + topic);
+            return this;
+        });
         return *this;
     }
 
     void notifyObservers(const Event& event) {
-        std::lock_guard<std::mutex> lock(mtx);
-        log("Notifying observers for topic: " + event.topic + ", Event ID: " + std::to_string(event.eventId));
-        if (topicObservers.find(event.topic) != topicObservers.end()) {
-            for (auto& observer : topicObservers[event.topic]) {
-                if (observer) {
-                    observer->update(event);
+        locker.runWithLockGuard([&] {
+            log("Notifying observers for topic: " + event.topic + ", Event ID: " + std::to_string(event.eventId));
+            if (topicObservers.find(event.topic) != topicObservers.end()) {
+                for (auto& observer : topicObservers[event.topic]) {
+                    if (observer) {
+                        observer->update(event);
+                    }
                 }
             }
-        }
+        });
     }
 };
 
@@ -63,22 +90,24 @@ public:
 class EventIdGenerator {
 private:
     std::unordered_map<std::string, int> topicEventCounters;
-    std::mutex mtx;
+    MutexLocker locker;
 
 public:
     int getNextEventId(const std::string& topic) {
-        std::lock_guard<std::mutex> lock(mtx);
-        int& counter = topicEventCounters[topic]; // Access or initialize counter for topic
-        return ++counter; // Increment and return the counter
+        return locker.runWithLockGuard([&] {
+            int& counter = topicEventCounters[topic]; // Access or initialize counter for topic
+            return ++counter; // Increment and return the counter
+        });
     }
 };
 
 // Concrete Observer (Consumer)
 class Consumer : public Observer {
+
 private:
     int id; // Unique consumer ID
     std::queue<Event> eventQueue;
-    std::mutex mtx;
+    MutexLocker locker;
     std::condition_variable cv;
     std::atomic<bool> running{true};
 
@@ -88,37 +117,50 @@ public:
     }
 
     void update(const Event& event) override {
-        {
-            std::lock_guard<std::mutex> lock(mtx);
+        locker.runWithLockGuard([&] {
             eventQueue.push(event);
             log("Consumer " + std::to_string(id) + " received event: Producer " +
                 std::to_string(event.producerId) + ", Topic " + event.topic +
                 ", Event " + std::to_string(event.eventId));
-        }
+        });
         cv.notify_one();
     }
 
     void processEvents() {
         while (running) {
-            Event event;
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [this] { return !eventQueue.empty() || !running; });
+            std::optional<Event> eventOpt = locker.runWithUniqueLock([&](std::unique_lock<std::mutex> lock) {
+                // Wait for a new event or stop signal
+                cv.wait(lock, [this] {
+                    return !eventQueue.empty() || !running;
+                });
 
+                // Exit if no events are left and stop signal is received
                 if (!running && eventQueue.empty()) {
-                    break;
+                    return std::optional<Event>{}; // Return an empty optional
                 }
 
-                event = eventQueue.front();
+                // Retrieve and remove the event from the queue
+                Event event = eventQueue.front();
                 eventQueue.pop();
+                return std::optional<Event>{event};
+            });
+
+            // Break the loop if no event was retrieved
+            if (!eventOpt.has_value()) {
+                break;
             }
+
+            // Process the event outside the critical section
+            const auto& event = eventOpt.value();
             log("Consumer " + std::to_string(id) + " processed event: Producer " +
                 std::to_string(event.producerId) + ", Topic " + event.topic +
                 ", Event " + std::to_string(event.eventId) +
                 ", Change: " + event.changeData);
         }
+
         log("Consumer " + std::to_string(id) + " stopped processing events.");
     }
+
 
     void stop() {
         running = false;
@@ -135,7 +177,9 @@ private:
     EventIdGenerator& eventGenerator; // Shared event ID generator
 
 public:
-    explicit Producer(int id, EventIdGenerator& generator) : id(id), eventGenerator(generator) {}
+    explicit Producer(int id, EventIdGenerator& generator) 
+        : id(id), eventGenerator(generator) 
+    {}
 
     Producer& addObserver(const std::string& topic, const std::shared_ptr<Observer>& observer) {
         Observable::addObserver(topic, observer);
@@ -145,7 +189,7 @@ public:
     Producer& produceAsync(const std::string& topic, int numEvents) {
         producerFuture = std::async(std::launch::async, [this, topic, numEvents]() {
             for (int i = 0; i < numEvents; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Simulate work
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000)); // Simulate work
                 
                 // Get the next unique event ID for the topic
                 int eventId = eventGenerator.getNextEventId(topic);
