@@ -235,11 +235,53 @@ public:
  * Producer class generates events and notifies observers.
  */
 class Producer : public Observable {
+
 private:
     int id; ///< Unique producer ID.
-    std::future<void> producerFuture; ///< Future for asynchronous event generation.
     EventIdGenerator& eventGenerator; ///< Shared event ID generator.
-    std::function<std::string(int, const std::string&)> dataGenerationLogic; ///< Custom data generation logic.
+    std::function<Event(Producer&)> dataGenerationHandler; ///< Custom data generation handler.
+    std::deque<Event> eventQueue; ///< Queue for detected events.
+    MutexLocker queueLocker; ///< MutexLocker for the event queue.
+    std::atomic<bool> running{true}; ///< Indicates if the producer is running.
+    std::condition_variable cv; ///< Condition variable for notification.
+    std::mutex cvMutex; ///< Mutex for the condition variable.
+    std::future<void> detectionFuture; ///< Future for detection thread.
+    std::future<void> notificationFuture; ///< Future for notification thread.
+
+    /**
+     * Detects events and pushes them to the event queue.
+     */
+    void detectionThreadFunction() {
+        while (running) {
+            Event event = dataGenerationHandler(*this);
+            log("Producer " + std::to_string(id) + " detected event: " + std::to_string(event.eventId) + " on topic " + event.topic);
+            queueLocker.runWithLockGuard([&]() {
+                eventQueue.push_back(event);
+            });
+            cv.notify_one();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Avoid CPU overuse.
+        }
+    }
+
+    /**
+     * Notifies observers of events from the event queue.
+     */
+    void notificationThreadFunction() {
+        while (running || !eventQueue.empty()) {
+            std::unique_lock<std::mutex> lock(cvMutex);
+            cv.wait(lock, [this] {
+                return !eventQueue.empty() || !running;
+            });
+
+            if (!eventQueue.empty()) {
+                queueLocker.runWithLockGuard([&]() {
+                    Event event = eventQueue.front();
+                    eventQueue.pop_front();
+                    notifyObservers(event);
+                });
+            }
+        }
+    }
 
 public:
     /**
@@ -248,49 +290,36 @@ public:
      * @param generator Reference to the event ID generator.
      * @param logic Custom logic for generating event data.
      */
-    explicit Producer(int id, EventIdGenerator& generator, std::function<std::string(int, const std::string&)> logic) 
-        : id(id), eventGenerator(generator), dataGenerationLogic(std::move(logic)) {}
+    explicit Producer(int id, EventIdGenerator& generator, std::function<Event(Producer&)> logic)
+        : id(id), eventGenerator(generator), dataGenerationHandler(std::move(logic)) {}
 
     /**
-     * Adds an observer to a topic.
-     * @param topic The topic to observe.
-     * @param observer The observer to add.
+     * Starts producing events asynchronously.
      * @return A reference to the current object.
      */
-    Producer& addObserver(const std::string& topic, const std::shared_ptr<Observer>& observer) {
-        Observable::addObserver(topic, observer);
+    Producer& produceAsync() {
+        detectionFuture = std::async(std::launch::async, &Producer::detectionThreadFunction, this);
+        notificationFuture = std::async(std::launch::async, &Producer::notificationThreadFunction, this);
         return *this;
     }
 
-    /**
-     * Produces events asynchronously for a topic.
-     * @param topic The topic to produce events for.
-     * @param numEvents The number of events to generate.
-     * @return A reference to the current object.
-     */
-    Producer& produceAsync(const std::string& topic, int numEvents) {
-        producerFuture = std::async(std::launch::async, [this, topic, numEvents]() {
-            for (int i = 0; i < numEvents; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                int eventId = eventGenerator.getNextEventId(topic);
-                std::string data = dataGenerationLogic(id, topic);
-                Event event{id, topic, eventId, data};
-                log("Producer " + std::to_string(id) + " generated event: " +
-                    std::to_string(event.eventId) + " on topic " + topic);
-                notifyObservers(event);
-            }
-        });
-        return *this;
+    Event createEvent(const std::string& topic, const std::string& data) {
+        return Event{ id, topic, eventGenerator.getNextEventId(topic), data };
     }
 
     /**
-     * Waits for the producer to finish generating events.
+     * Stops the producer from generating further events.
      */
-    void wait() {
-        if (producerFuture.valid()) {
-            producerFuture.get();
+    void stop() {
+        running = false;
+        cv.notify_all();
+        if (detectionFuture.valid()) {
+            detectionFuture.get();
         }
-        log("Producer " + std::to_string(id) + " finished producing.");
+        if (notificationFuture.valid()) {
+            notificationFuture.get();
+        }
+        log("Producer " + std::to_string(id) + " stop signal issued.");
     }
 };
 
@@ -321,7 +350,7 @@ public:
      * @param logic Custom logic for generating event data.
      * @return A shared pointer to the created producer.
      */
-    std::shared_ptr<Producer> createProducer(int id, std::function<std::string(int, const std::string&)> logic) {
+    std::shared_ptr<Producer> createProducer(int id, std::function<Event(Producer&)> logic) {
         auto producer = std::make_shared<Producer>(id, eventGenerator, std::move(logic));
         producers.push_back(producer);
         return producer;
@@ -343,7 +372,10 @@ public:
      * @return A reference to the current object.
      */
     ProducerConsumerOrchestrator& consumeEvents() {
-        for (const auto& config : configurations) config();
+        for (const auto& config : configurations) {
+            // Apply configurations before starting the consumers.
+            config();
+        }
 
         std::vector<std::thread> threads;
         for (auto& consumer : consumers) {
@@ -351,7 +383,13 @@ public:
         }
 
         for (auto& producer : producers) {
-            producer->wait();
+            producer->produceAsync();
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        for (auto& producer : producers) {
+            producer->stop();
         }
 
         for (auto& consumer : consumers) {
@@ -382,20 +420,20 @@ int main() {
                 log("Custom handler for Consumer 2: Processing " + event.changeData);
             });
 
-            auto producer1 = orchestrator.createProducer(1, [](int producerId, const std::string& topic) {
-                return "Custom event data for topic " + topic + " by Producer " + std::to_string(producerId);
+            auto producer1 = orchestrator.createProducer(1, [&](Producer& producer) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                return producer.createEvent("topicA", "Custom event data for topic A");
             });
 
             producer1->addObserver("topicA", consumer1);
 
-            auto producer2 = orchestrator.createProducer(2, [](int producerId, const std::string& topic) {
-                return "Generated data for topic " + topic;
+            auto producer2 = orchestrator.createProducer(2, [&](Producer& producer) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                return producer.createEvent("topicA", "Custom event data for topic A");
             });
 
             producer2->addObserver("topicB", consumer2);
 
-            producer1->produceAsync("topicA", 1);
-            producer2->produceAsync("topicB", 1);
         })
         .consumeEvents();
 
