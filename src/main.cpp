@@ -163,20 +163,17 @@ public:
 class Consumer : public Observer {
 private:
     int id; ///< Unique consumer ID.
-    std::queue<Event> eventQueue; ///< Queue of received events.
     MutexLocker locker; ///< MutexLocker for thread safety.
-    std::condition_variable cv; ///< Condition variable for event synchronization.
-    std::atomic<bool> running{true}; ///< Indicates if the consumer is running.
-    std::function<void(const Event&)> consumeLogic; ///< Custom consume logic.
+    std::function<void(const Event&)> consumeHandler; ///< Custom consume logic.
 
 public:
     /**
-     * Constructor initializes a consumer with an ID and custom logic.
+     * Constructor initializes a consumer with an ID and custom handler.
      * @param id Unique consumer ID.
      * @param logic Custom logic for processing events.
      */
-    explicit Consumer(int id, std::function<void(const Event&)> logic) 
-        : id(id), consumeLogic(std::move(logic)) {
+    explicit Consumer(int id, std::function<void(const Event&)> handler) 
+        : id(id), consumeHandler(std::move(handler)) {
         log("Consumer " + std::to_string(id) + " created.");
     }
 
@@ -186,49 +183,13 @@ public:
      */
     void update(const Event& event) override {
         locker.runWithLockGuard([&] {
-            eventQueue.push(event);
             log("Consumer " + std::to_string(id) + " received event: Producer " +
                 std::to_string(event.producerId) + ", Topic " + event.topic +
                 ", Event " + std::to_string(event.eventId));
+            consumeHandler(event);                
         });
-        cv.notify_one();
     }
 
-    /**
-     * Processes events in the queue until stopped.
-     */
-    void processEvents() {
-        while (running) {
-            std::optional<Event> eventOpt = locker.runWithUniqueLock([&](std::unique_lock<std::mutex> lock) {
-                cv.wait(lock, [this] {
-                    return !eventQueue.empty() || !running;
-                });
-                if (!running && eventQueue.empty()) {
-                    return std::optional<Event>{};
-                }
-                Event event = eventQueue.front();
-                eventQueue.pop();
-                return std::optional<Event>{event};
-            });
-
-            if (!eventOpt.has_value()) {
-                break;
-            }
-
-            const auto& event = eventOpt.value();
-            consumeLogic(event);
-        }
-        log("Consumer " + std::to_string(id) + " stopped processing events.");
-    }
-
-    /**
-     * Stops the consumer from processing further events.
-     */
-    void stop() {
-        running = false;
-        cv.notify_all();
-        log("Consumer " + std::to_string(id) + " stop signal issued.");
-    }
 };
 
 /**
@@ -239,7 +200,7 @@ class Producer : public Observable {
 private:
     int id; ///< Unique producer ID.
     EventIdGenerator& eventGenerator; ///< Shared event ID generator.
-    std::function<Event(Producer&)> dataGenerationHandler; ///< Custom data generation handler.
+    std::function<Event(Producer&)> eventHandler; ///< Custom data generation handler.
     std::deque<Event> eventQueue; ///< Queue for detected events.
     MutexLocker queueLocker; ///< MutexLocker for the event queue.
     std::atomic<bool> running{true}; ///< Indicates if the producer is running.
@@ -253,7 +214,7 @@ private:
      */
     void detectionThreadFunction() {
         while (running) {
-            Event event = dataGenerationHandler(*this);
+            Event event = eventHandler(*this);
             log("Producer " + std::to_string(id) + " detected event: " + std::to_string(event.eventId) + " on topic " + event.topic);
             queueLocker.runWithLockGuard([&]() {
                 eventQueue.push_back(event);
@@ -291,7 +252,7 @@ public:
      * @param logic Custom logic for generating event data.
      */
     explicit Producer(int id, EventIdGenerator& generator, std::function<Event(Producer&)> logic)
-        : id(id), eventGenerator(generator), dataGenerationHandler(std::move(logic)) {}
+        : id(id), eventGenerator(generator), eventHandler(std::move(logic)) {}
 
     /**
      * Starts producing events asynchronously.
@@ -372,32 +333,22 @@ public:
      * @return A reference to the current object.
      */
     ProducerConsumerOrchestrator& consumeEvents() {
+        log("Apply configurations before starting the producers.");
         for (const auto& config : configurations) {
-            // Apply configurations before starting the consumers.
             config();
         }
 
-        std::vector<std::thread> threads;
-        for (auto& consumer : consumers) {
-            threads.emplace_back([consumer] { consumer->processEvents(); });
-        }
-
+        log("Starting producers...");
         for (auto& producer : producers) {
             producer->produceAsync();
         }
 
+        log("Simulation running...");
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
+        log("Stopping producers...");
         for (auto& producer : producers) {
             producer->stop();
-        }
-
-        for (auto& consumer : consumers) {
-            consumer->stop();
-        }
-
-        for (auto& thread : threads) {
-            if (thread.joinable()) thread.join();
         }
 
         return *this;
